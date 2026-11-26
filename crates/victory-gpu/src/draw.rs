@@ -651,10 +651,13 @@ impl State {
                 self.apply_depth_bounds(list);
             }
             self.host_pipeline = p.pso.as_raw() as usize;
-            list.used_pipeline(&p.name);
             // The title may release the pipeline before it submits the list.
-            list.keep(&p.pso);
-            list.keep(&p.root);
+            // Bound again after an indirect clamp, the list holds it already.
+            if !list.holds_pipeline(self.host_pipeline) {
+                list.used_pipeline(&p.name);
+                list.keep(&p.pso);
+                list.keep(&p.root);
+            }
         }
         #[cfg(feature = "diagnostics")]
         crate::capture::binding(&p.name);
@@ -1785,7 +1788,6 @@ impl State {
             _ => false,
         };
         if !ran {
-            crate::indirect::done(list, &clamped);
             #[cfg(feature = "diagnostics")]
             match crate::pipeline::host_pipeline(self.pipeline as This) {
                 None => {
@@ -1809,7 +1811,7 @@ impl State {
         // copies the list keeps alive (refresh), the signature is cached.
         unsafe {
             list.list.ExecuteIndirect(
-                &signature,
+                signature,
                 max,
                 &clamped,
                 0,
@@ -1829,7 +1831,6 @@ impl State {
                 crate::capture::read_indirect(list, (&clamped, 0), count, (kind, stride, max), name, always);
             }
         }
-        crate::indirect::done(list, &clamped);
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {
@@ -1841,13 +1842,22 @@ impl State {
 
 /// The host command signature for one argument of `kind` with records
 /// `stride` bytes apart (no root arguments, so no root signature), made
-/// once.
-fn host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
-    static MADE: std::sync::Mutex<Vec<((u32, u32), ID3D12CommandSignature)>> =
-        std::sync::Mutex::new(Vec::new());
+/// once and kept for good. Each thread remembers the last one it asked
+/// for: the title's threads ask for the same few, and the lock and the
+/// object's reference count would be shared by all of them.
+fn host_signature(kind: u32, stride: u32) -> Option<&'static ID3D12CommandSignature> {
+    type Made = ((u32, u32), &'static ID3D12CommandSignature);
+    thread_local! {
+        static LAST: std::cell::Cell<Option<Made>> = const { std::cell::Cell::new(None) };
+    }
+    if let Some((_, s)) = LAST.get().filter(|(k, _)| *k == (kind, stride)) {
+        return Some(s);
+    }
+    static MADE: std::sync::Mutex<Vec<Made>> = std::sync::Mutex::new(Vec::new());
     let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some((_, s)) = made.iter().find(|(k, _)| *k == (kind, stride)) {
-        return Some(s.clone());
+    if let Some(&m) = made.iter().find(|(k, _)| *k == (kind, stride)) {
+        LAST.set(Some(m));
+        return Some(m.1);
     }
     let argument = D3D12_INDIRECT_ARGUMENT_DESC {
         Type: D3D12_INDIRECT_ARGUMENT_TYPE(kind as i32),
@@ -1872,9 +1882,10 @@ fn host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
         once!(error = %e, kind, stride, "host command signature refused");
         return None;
     }
-    let signature = signature?;
-    made.push(((kind, stride), signature.clone()));
-    Some(signature)
+    let m = ((kind, stride), &*Box::leak(Box::new(signature?)));
+    made.push(m);
+    LAST.set(Some(m));
+    Some(m.1)
 }
 
 /// Gets what a shader reads or writes through a view ready: buffer data
@@ -2028,6 +2039,24 @@ const QUAD_STRIP: u32 = 20;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A command signature is made once: every thread, and the same thread
+    /// asking again after another, gets the same object.
+    #[test]
+    fn host_signatures_are_made_once() {
+        if crate::host::host().is_none() {
+            return; // no host GPU here
+        }
+        let dispatch = host_signature(2, 12).unwrap();
+        let draw = host_signature(0, 16).unwrap();
+        assert!(!std::ptr::eq(dispatch, draw));
+        assert!(std::ptr::eq(host_signature(2, 12).unwrap(), dispatch));
+        let other = std::thread::spawn(|| host_signature(2, 12).unwrap() as *const _ as usize)
+            .join()
+            .unwrap();
+        assert_eq!(other, dispatch as *const _ as usize);
+        assert_eq!(dispatch.as_raw(), host_signature(2, 12).unwrap().as_raw());
+    }
 
     /// A root signature that indexes the heaps directly needs one of each
     /// kind bound before it is set: our sampler heap stands in for a title

@@ -128,7 +128,7 @@ unsafe impl Sync for Clamp {}
 fn clamp() -> Option<&'static Clamp> {
     static CLAMP: std::sync::OnceLock<Option<Clamp>> = std::sync::OnceLock::new();
     CLAMP
-        .get_or_init(|| match make() {
+        .get_or_init(|| match make(SOURCE) {
             Ok(c) => Some(c),
             Err(e) => {
                 tracing::warn!(error = %e, "no argument clamp: indirect execution dropped");
@@ -138,15 +138,17 @@ fn clamp() -> Option<&'static Clamp> {
         .as_ref()
 }
 
-fn make() -> windows::core::Result<Clamp> {
+/// A compute pipeline of ours from HLSL `source` with its root signature
+/// inside.
+fn make(source: &str) -> windows::core::Result<Clamp> {
     let device = &host().ok_or_else(windows::core::Error::empty)?.device;
     let mut code: Option<ID3DBlob> = None;
     let mut errors: Option<ID3DBlob> = None;
     // SAFETY: the source and names live through the call; out pointers ours.
     let compiled = unsafe {
         D3DCompile(
-            SOURCE.as_ptr().cast(),
-            SOURCE.len(),
+            source.as_ptr().cast(),
+            source.len(),
             s!("clamp"),
             None,
             None,
@@ -188,16 +190,17 @@ fn make() -> windows::core::Result<Clamp> {
 /// Records, in `list`, the clamp of `records` records of `kind` (PC
 /// argument numbering) `stride` bytes apart at host address `gpu` (a title
 /// buffer's copy, only read) into the list's own argument buffer, left
-/// ready to be read as arguments: that buffer, for [`done`] after the
-/// execution. Replaces the list's compute root signature and pipeline
-/// (callers bind theirs after). `None` if the clamp is not available.
+/// ready to be read as arguments: that buffer. Replaces the list's compute
+/// root signature and pipeline (callers bind theirs after). `None` if the
+/// clamp is not available.
 ///
 /// Title buffers' copies are never transitioned: they are common between
 /// submissions and every use promotes them (shader and root views, the
 /// input assembler, these reads), with unordered-access barriers for order.
-/// Only the list's argument buffer moves, common, unordered access,
-/// indirect argument, common: its states are known whatever order lists
-/// run in.
+/// Only the list's argument buffer moves: common (or indirect argument,
+/// as the execution before left it), unordered access, indirect argument,
+/// and common again when the list closes (`HostList::close`): its states
+/// are known whatever order lists run in.
 // shortcut: a buffer a shader writes through an unordered view and the
 // input assembler then reads in one submission is, by the letter of D3D12,
 // promoted to a write state the input assembler may not use (the debug
@@ -210,16 +213,17 @@ pub(crate) fn bound(list: &HostList, gpu: u64, (kind, stride, records): (u32, u3
     if !gpu.is_multiple_of(4) || !stride.is_multiple_of(4) {
         return None;
     }
-    let out = list.arguments(u64::from(stride) * u64::from(records.max(1)))?;
+    let (out, from) = list.arguments(u64::from(stride) * u64::from(records.max(1)))?;
     let l = &list.list;
     let constants = [kind, stride, records, 0];
     // SAFETY: an open list; our root signature, pipeline and buffers, and
     // a title buffer's copy the caller's list holds.
     unsafe {
-        // Earlier shader writes (the title's argument passes) first.
+        // Earlier shader writes (the title's argument passes) first; the
+        // execution before has read its arguments.
         l.ResourceBarrier(&[
             uav_barrier(),
-            transition(&out, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+            transition(&out, from, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
         ]);
         l.SetComputeRootSignature(&c.root);
         l.SetPipelineState(&c.pso);
@@ -235,18 +239,6 @@ pub(crate) fn bound(list: &HostList, gpu: u64, (kind, stride, records): (u32, u3
         ]);
     }
     Some(out)
-}
-
-/// After the execution: the list's argument buffer back to common.
-pub(crate) fn done(list: &HostList, arguments: &ID3D12Resource) {
-    // SAFETY: an open list and a live buffer.
-    unsafe {
-        list.list.ResourceBarrier(&[transition(
-            arguments,
-            D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
-            D3D12_RESOURCE_STATE_COMMON,
-        )])
-    };
 }
 
 fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
@@ -297,9 +289,7 @@ mod tests {
             let gpu = buffer.GetGPUVirtualAddress();
             let mut out = None;
             for _ in 0..calls {
-                let clamped = super::bound(&list, gpu, spec).unwrap();
-                super::done(&list, &clamped);
-                out = Some(clamped);
+                out = Some(super::bound(&list, gpu, spec).unwrap());
             }
             list.close();
             host.execute(&[&list]);
@@ -380,7 +370,6 @@ mod tests {
                 .iter()
                 .map(|l| {
                     let out = super::bound(l, gpu, (2, 12, 1)).unwrap();
-                    super::done(l, &out);
                     l.close();
                     (out, issued())
                 })
@@ -405,6 +394,119 @@ mod tests {
             }
             // SAFETY: as above.
             assert_eq!(unsafe { data.cast::<[u32; 3]>().read_volatile() }, [70_000, 1, 1], "the title's copy as written");
+        }
+    }
+
+    /// Indirect dispatches in one list, each with its own records, through
+    /// the list's one argument buffer (left readable as arguments from one
+    /// execution to the clamp of the next, and replaced by a bigger one
+    /// while readable): every execution runs the groups its own records
+    /// hold, clamped, and every barrier starts from the buffer's current
+    /// state, all common at the close.
+    #[test]
+    fn each_execution_reads_its_own_clamped_records() {
+        use super::*;
+        use crate::host::tests::{issued, replay};
+        use windows::core::Interface;
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        // Each group adds one to the word of its execution.
+        let counting = super::make(
+            r#"
+#define RS "RootConstants(num32BitConstants=1, b0), UAV(u0)"
+cbuffer Execution : register(b0) { uint execution; };
+RWByteAddressBuffer groups : register(u0);
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void main() {
+    uint before;
+    groups.InterlockedAdd(execution * 4, 1, before);
+}
+"#,
+        )
+        .unwrap();
+        let argument = D3D12_INDIRECT_ARGUMENT_DESC {
+            Type: D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH,
+            ..Default::default()
+        };
+        let desc = D3D12_COMMAND_SIGNATURE_DESC {
+            ByteStride: 12,
+            NumArgumentDescs: 1,
+            pArgumentDescs: &argument,
+            NodeMask: 0,
+        };
+        let mut signature: Option<ID3D12CommandSignature> = None;
+        // SAFETY: one argument, no root arguments.
+        unsafe {
+            host.device
+                .CreateCommandSignature(&desc, None::<&ID3D12RootSignature>, &mut signature)
+        }
+        .unwrap();
+        let signature = signature.unwrap();
+        // Records, and the groups each execution runs: x past 65,535;
+        // 2^21 groups in all (run empty); 6,000 records (past the first
+        // argument buffer's 64 KiB) of which only the first has groups;
+        // then the bigger buffer again.
+        let big = 6_000;
+        let executions: [(Vec<[u32; 3]>, u32); 5] = [
+            (vec![[3, 2, 1]], 6),
+            (vec![[70_000, 1, 1]], 65_535),
+            (vec![[2_048, 1_024, 1]], 0),
+            (
+                std::iter::once([5, 1, 1])
+                    .chain(std::iter::repeat_n([0, 0, 0], big - 1))
+                    .collect(),
+                5,
+            ),
+            (vec![[7, 1, 1]], 7),
+        ];
+        let words: usize = executions.iter().map(|(r, _)| r.len() * 3).sum();
+        let (title, data) = host.shared_buffer(words as u64 * 4).unwrap();
+        let (counts, counted) = host.shared_buffer(256).unwrap();
+        let list = host.new_list().unwrap();
+        issued();
+        let mut outs = Vec::new();
+        // SAFETY: our mapped buffers, written before the list runs and read
+        // after it has; an open list, our pipelines and live buffers.
+        unsafe {
+            counted.cast::<[u32; 64]>().write_volatile([0; 64]);
+            let mut at = 0;
+            for (i, (records, _)) in executions.iter().enumerate() {
+                let gpu = title.GetGPUVirtualAddress() + at as u64 * 4;
+                for (k, r) in records.iter().enumerate() {
+                    data.cast::<[u32; 3]>().add(at / 3 + k).write_volatile(*r);
+                }
+                at += records.len() * 3;
+                let out = super::bound(&list, gpu, (2, 12, records.len() as u32)).unwrap();
+                let l = &list.list;
+                l.SetComputeRootSignature(&counting.root);
+                l.SetPipelineState(&counting.pso);
+                l.SetComputeRoot32BitConstants(0, 1, [i as u32].as_ptr().cast(), 0);
+                l.SetComputeRootUnorderedAccessView(1, counts.GetGPUVirtualAddress());
+                l.ExecuteIndirect(&signature, records.len() as u32, &out, 0, None, 0);
+                if outs
+                    .last()
+                    .is_none_or(|o: &ID3D12Resource| o.as_raw() != out.as_raw())
+                {
+                    outs.push(out);
+                }
+            }
+            list.close();
+            let mut states: std::collections::HashMap<usize, u32> =
+                outs.iter().map(|o| (o.as_raw() as usize, 0)).collect();
+            let run = issued();
+            host.execute(&[&list]);
+            replay(&run, &mut states).unwrap();
+            assert!(states.values().all(|&s| s == 0), "all common again");
+            assert_eq!(
+                outs.len(),
+                2,
+                "the argument buffer was replaced by a bigger one"
+            );
+            let ran = counted.cast::<[u32; 64]>().read_volatile();
+            let expected: Vec<u32> = executions.iter().map(|(_, groups)| *groups).collect();
+            assert_eq!(ran[..executions.len()], expected[..]);
         }
     }
 

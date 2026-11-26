@@ -430,6 +430,21 @@ pub(crate) mod tests {
 
     use super::*;
 
+    /// A list holds the pipeline it was last asked about until its reset:
+    /// a pipeline bound again after the indirect clamp's is kept once.
+    #[test]
+    fn a_list_holds_the_pipeline_it_last_kept_until_its_reset() {
+        let Some(host) = host() else { return };
+        let list = host.new_list().unwrap();
+        assert!(!list.holds_pipeline(1));
+        assert!(list.holds_pipeline(1));
+        assert!(!list.holds_pipeline(2));
+        assert!(!list.holds_pipeline(1));
+        list.close();
+        list.reset();
+        assert!(!list.holds_pipeline(1));
+    }
+
     /// Shaders that use title memory mark their reads in their own bitmap:
     /// read marks of both bitmaps are taken, each slot once until it is
     /// forgotten, and a forgotten slot's next read is taken again.
@@ -782,6 +797,15 @@ pub(crate) mod tests {
     }
 }
 
+/// A list's buffer of clamped indirect arguments, with its width, and
+/// whether an execution left it readable as arguments (it is common
+/// otherwise).
+#[derive(Default)]
+struct Arguments {
+    buffer: Option<(ID3D12Resource, u64)>,
+    readable: bool,
+}
+
 /// A host command list and its allocator, always used together.
 pub(crate) struct HostList {
     allocator: ID3D12CommandAllocator,
@@ -821,10 +845,12 @@ pub(crate) struct HostList {
     id: u64,
     /// The work its indirect executions may still do (`indirect`): a
     /// shader-writable word, zeroed when the list is submitted.
-    budget: OnceLock<Option<(ID3D12Resource, usize)>>,
+    budget: OnceLock<Option<(ID3D12Resource, usize, u64)>>,
     /// Clamped indirect arguments (`crate::indirect`), reused by each
     /// execution in turn; replaced by a bigger one when too small.
-    arguments: Mutex<Option<ID3D12Resource>>,
+    arguments: Mutex<Arguments>,
+    /// The host pipeline last kept by [`HostList::holds_pipeline`].
+    kept_pipeline: std::sync::atomic::AtomicUsize,
     /// The texts of the markers `note_op` set, in order (for device-removed
     /// data without marker texts), with the host GPU range a copy reads.
     #[cfg(feature = "diagnostics")]
@@ -1141,7 +1167,8 @@ impl Host {
                 pipelines: Mutex::default(),
                 id,
                 budget: OnceLock::new(),
-                arguments: Mutex::new(None),
+                arguments: Mutex::default(),
+                kept_pipeline: std::sync::atomic::AtomicUsize::new(0),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
@@ -1761,6 +1788,22 @@ impl HostList {
     }
 
     pub(crate) fn close(&self) {
+        // The argument buffer an indirect execution left readable as
+        // arguments: common again, as every list leaves it.
+        let mut arguments = self.arguments.lock().unwrap_or_else(|e| e.into_inner());
+        if let (true, Some((buffer, _))) =
+            (std::mem::take(&mut arguments.readable), &arguments.buffer)
+        {
+            // SAFETY: an open list and a live buffer, in the state named.
+            unsafe {
+                self.list.ResourceBarrier(&[transition(
+                    buffer,
+                    D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                    D3D12_RESOURCE_STATE_COMMON,
+                )])
+            };
+        }
+        drop(arguments);
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
             let count = (self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32).min(STAMPS - 1);
@@ -1782,6 +1825,11 @@ impl HostList {
     /// for).
     pub(crate) fn reset(&self) {
         *self.deferred() = Deferred::default();
+        self.arguments
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .readable = false;
+        self.kept_pipeline.store(0, Ordering::Relaxed);
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -2221,11 +2269,13 @@ impl HostList {
     /// The host address of the list's indirect-work budget, zeroed at each
     /// submission of the list from the first use after a reset on.
     pub(crate) fn budget(&self) -> Option<u64> {
-        let (buffer, data) = self
+        let (_, data, gpu) = self
             .budget
             .get_or_init(|| {
                 let (b, d) = host()?.shared_buffer(256)?;
-                Some((b, d as usize))
+                // SAFETY: a live buffer.
+                let gpu = unsafe { b.GetGPUVirtualAddress() };
+                Some((b, d as usize, gpu))
             })
             .as_ref()?;
         let mut deferred = self.deferred();
@@ -2237,25 +2287,57 @@ impl HostList {
                 .copies
                 .push(Step::Host(Box::new(move || unsafe { (at as *mut u32).write_volatile(0) })));
         }
-        // SAFETY: a live buffer.
-        Some(unsafe { buffer.GetGPUVirtualAddress() })
+        Some(*gpu)
     }
 
-    /// The list's argument buffer, at least `bytes` long, common between
-    /// its uses (`crate::indirect`).
-    pub(crate) fn arguments(&self, bytes: u64) -> Option<ID3D12Resource> {
+    /// The list's argument buffer, at least `bytes` long, and the state it
+    /// is in: common, or still readable as arguments from the execution
+    /// before (`crate::indirect`). The caller leaves it readable as
+    /// arguments; the list's close puts it back to common, so between
+    /// lists it is always common.
+    pub(crate) fn arguments(&self, bytes: u64) -> Option<(ID3D12Resource, D3D12_RESOURCE_STATES)> {
         let mut arguments = self.arguments.lock().unwrap_or_else(|e| e.into_inner());
-        // SAFETY: a plain query on a live buffer.
-        if let Some(b) = arguments.as_ref().filter(|b| unsafe { b.GetDesc() }.Width >= bytes) {
-            return Some(b.clone());
+        let state = if arguments.readable {
+            D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT
+        } else {
+            D3D12_RESOURCE_STATE_COMMON
+        };
+        if let Some((b, _)) = arguments
+            .buffer
+            .as_ref()
+            .filter(|(_, width)| *width >= bytes)
+        {
+            let b = b.clone();
+            arguments.readable = true;
+            return Some((b, state));
         }
-        let (made, _) = host()?.shared_buffer(bytes.next_power_of_two().max(1 << 16))?;
+        let width = bytes.next_power_of_two().max(1 << 16);
+        let (made, _) = host()?.shared_buffer(width)?;
         name(&made, || "indirect arguments".into());
-        // Commands recorded earlier may still name the smaller one.
-        if let Some(old) = arguments.replace(made.clone()) {
+        // Commands recorded earlier may still name the smaller one: the
+        // list holds it, back in common.
+        if let Some((old, _)) = arguments.buffer.replace((made.clone(), width)) {
+            if arguments.readable {
+                // SAFETY: an open list and a live buffer, in the state named.
+                unsafe {
+                    self.list.ResourceBarrier(&[transition(
+                        &old,
+                        D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                        D3D12_RESOURCE_STATE_COMMON,
+                    )])
+                };
+            }
             self.keep(&old);
         }
-        Some(made)
+        arguments.readable = true;
+        Some((made, D3D12_RESOURCE_STATE_COMMON))
+    }
+
+    /// Whether the list already holds `pipeline` (a host pipeline object):
+    /// the one it was last asked about since its reset. A pipeline bound
+    /// again after the indirect clamp's own is kept once.
+    pub(crate) fn holds_pipeline(&self, pipeline: usize) -> bool {
+        self.kept_pipeline.swap(pipeline, Ordering::Relaxed) == pipeline
     }
 
     /// Keeps `object` alive until the list is reset.
