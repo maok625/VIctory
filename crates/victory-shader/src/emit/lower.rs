@@ -87,6 +87,18 @@ pub(crate) struct Parts<'a> {
     pub mesh_stride: u32,
     /// Writes through buffer views mark their pages (`emit`, "Write marks").
     pub view_marks: bool,
+    /// View descriptor slots in the host's heap (`0` means [`super::HEAP_VIEWS`]).
+    pub host_heap_views: u32,
+}
+
+impl Parts<'_> {
+    fn heap_views(&self) -> u32 {
+        if self.host_heap_views == 0 {
+            super::HEAP_VIEWS
+        } else {
+            self.host_heap_views.max(4)
+        }
+    }
 }
 
 enum Stop {
@@ -550,6 +562,7 @@ impl<'a> Lower<'a> {
             }
         }
         let mut s = Shader::new(x.native.stage == HwStage::Ps);
+        s.host_heap_views = x.heap_views();
         s.inputs = x.inputs.clone();
         s.outputs = x.outputs.clone();
         let insts = || p.blocks.iter().flat_map(|b| &b.insts);
@@ -5549,7 +5562,7 @@ impl<'a> Lower<'a> {
             return index;
         }
         let c = self.cur;
-        let last = self.s.m.i32(super::HEAP_VIEWS - 1);
+        let last = self.s.m.i32(self.s.host_heap_views - 1);
         let over = self.s.m.cmp(c, pred::IUGT, index, last);
         let index = self.s.m.select(c, over, last, index);
         let four = self.s.m.i32(4);
@@ -5562,7 +5575,7 @@ impl<'a> Lower<'a> {
         let zero = self.s.m.i32(0);
         let none = self.s.m.cmp(c, pred::EQ, stride, zero);
         // The null unordered access view sits just below the null SRV.
-        let null = super::NULL_BUFFER_VIEW - u32::from(props.0 & 0x1000 != 0);
+        let null = super::null_buffer_view(self.s.host_heap_views) - u32::from(props.0 & 0x1000 != 0);
         let null = self.s.m.i32(null);
         self.s.m.select(c, none, null, index)
     }
@@ -10983,6 +10996,7 @@ mod tests {
             prims: vec![],
             mesh_stride: 0,
             view_marks: false,
+            host_heap_views: 0,
         })
         .map(|_| ())
     }
@@ -11034,6 +11048,7 @@ mod tests {
             prims: vec![],
             mesh_stride: 0,
             view_marks: false,
+            host_heap_views: 0,
         })
     }
 
@@ -11254,6 +11269,7 @@ mod tests {
             prims: vec![],
             mesh_stride: 0,
             view_marks: false,
+            host_heap_views: 0,
         })
         .unwrap();
 
@@ -12176,6 +12192,7 @@ mod tests {
                 prims: vec![],
                 mesh_stride: 0,
                 view_marks: false,
+                host_heap_views: 0,
             })
             .unwrap();
             assert!(lowered.wave_ops);

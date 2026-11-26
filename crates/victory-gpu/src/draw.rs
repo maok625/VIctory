@@ -3399,7 +3399,7 @@ void main(uint3 id : SV_DispatchThreadID) {
             &st,
             &io,
             &res,
-            Options { view_marks: true },
+            Options { view_marks: true, ..Default::default() },
         )
         .unwrap();
         assert!(host_shader.view_marks);

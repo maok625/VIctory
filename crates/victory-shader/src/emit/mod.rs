@@ -368,6 +368,12 @@ pub struct UserData {
     pub dword: u32,
 }
 
+/// The null raw buffer SRV index (UAV sits one slot below) for a host view
+/// heap of `views` slots (clamped to at least 4).
+pub fn null_buffer_view(views: u32) -> u32 {
+    views.max(4) - 2
+}
+
 /// How a translation is made.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Options {
@@ -375,6 +381,22 @@ pub struct Options {
     /// "Write marks"); the host must then bind the view-mark table and the
     /// bitmap ([`HostShader::view_marks`]).
     pub view_marks: bool,
+    /// View descriptor slots in the host's heap (indices above this are
+    /// clamped to the last slot, and null buffer views sit at
+    /// [`null_buffer_view`]); `0` means [`HEAP_VIEWS`].
+    pub host_heap_views: u32,
+}
+
+impl Options {
+    /// Effective view descriptor heap size, clamped to at least 4 (`0`
+    /// means [`HEAP_VIEWS`]).
+    pub fn heap_views(self) -> u32 {
+        if self.host_heap_views == 0 {
+            HEAP_VIEWS
+        } else {
+            self.host_heap_views.max(4)
+        }
+    }
 }
 
 /// Translates the vertex, pixel, compute or mesh program of a console
@@ -499,6 +521,7 @@ pub fn emit_with(
         prims: prims.clone(),
         mesh_stride,
         view_marks: options.view_marks,
+        host_heap_views: options.heap_views(),
     };
     let l = match lower::lower(&parts(st, res)) {
         // Discarded lanes kept on as helpers can read what no surviving

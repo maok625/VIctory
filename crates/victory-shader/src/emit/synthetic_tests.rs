@@ -142,6 +142,7 @@ fn lowered(native: &NativeProgram) -> Result<lower::Lowered, crate::ShaderError>
         prims: Vec::new(),
         mesh_stride: 0,
         view_marks: false,
+        host_heap_views: 0,
     })
 }
 
@@ -890,6 +891,7 @@ fn pops_wait_loop_exits_immediately_for_inactive_lanes() {
             prims: Vec::new(),
             mesh_stride: 0,
             view_marks: false,
+            host_heap_views: 0,
         })
         .expect("lower");
         if let Ok(mut v) =
