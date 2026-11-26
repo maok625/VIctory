@@ -90,6 +90,10 @@ pub(crate) struct Shadow {
     /// goes.
     base: u64,
     slice: Option<Slice>,
+    /// Ranges (title addresses) where the copy holds what shaders wrote
+    /// and title memory does not ([`Shadow::keep_writes`]): a refresh
+    /// widened to whole pages stops short of them ([`Shadow::widen`]).
+    kept: Mutex<std::collections::BTreeSet<(usize, usize)>>,
 }
 
 /// Snapshot segments (offset, bytes) and the pieces compared.
@@ -264,6 +268,7 @@ impl Shadow {
             marks,
             base: slice.map_or(0, |s| s.offset),
             slice,
+            kept: Mutex::default(),
         });
         if let Some(base) = marks {
             self::marks().owners.insert(base, Arc::downgrade(&shadow));
@@ -402,7 +407,47 @@ impl Shadow {
     /// in the copy and does not go into title memory (they computed it
     /// from memory with no copy, `crate::memory`).
     pub(crate) fn keep_writes(&self, address: usize, len: usize) {
+        if len > 0 {
+            self.kept
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert((address, address + len));
+        }
         self.copy_back_or_not(address, len, false);
+    }
+
+    /// `[from, to)` (inside the buffer) grown to the 64 KiB pages it
+    /// touches, cut to the buffer and short of ranges holding shaders'
+    /// kept writes. A page only partly inside a refreshed range is copied
+    /// in part and stays changed ([`crate::watch::Tracked::take`]), so it
+    /// was copied again at every later refresh reaching it: in the world,
+    /// about 80% of the bytes copied per frame (400-550 MB of 550-690 MB on
+    /// an RTX 4060 Ti). Taken whole, it is
+    /// guarded and copied again only once the title writes it.
+    fn widen(&self, from: usize, to: usize) -> (usize, usize) {
+        if self.tracked.is_none() {
+            return (from, to);
+        }
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let mut low = (from / PAGE * PAGE).max(start);
+        let mut high = to.div_ceil(PAGE).saturating_mul(PAGE).min(end);
+        let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+        for &(a, e) in kept.iter() {
+            if e <= low || a >= high {
+                continue;
+            }
+            if a < from {
+                low = low.max(e.min(from));
+            }
+            if e > to {
+                high = high.min(a.max(to));
+            }
+            if a < to && e > from {
+                // Kept writes inside the range itself: as asked, no more.
+                return (from, to);
+            }
+        }
+        (low.min(from), high.max(to))
     }
 
     fn copy_back_or_not(&self, address: usize, len: usize, back: bool) -> usize {
@@ -556,6 +601,7 @@ impl Shadow {
         if from >= to {
             return 0;
         }
+        let (from, to) = self.widen(from, to);
         let mut busy: Vec<(usize, usize)> = self
             .pending
             .lock()
@@ -1438,6 +1484,38 @@ pub(crate) mod tests {
         // Larger than a buffer: one of its own.
         let (_, _, _, d) = arena.take(CHUNK + 1, 4).unwrap();
         assert_eq!((arena.chunks.len(), d.chunk), (2, 1));
+    }
+
+    /// Small refreshes inside a page the title wrote take the whole page:
+    /// the next refreshes there copy nothing until the title writes again,
+    /// and bytes shaders' kept writes hold are not copied over.
+    #[test]
+    fn a_partial_refresh_takes_the_whole_page() {
+        let p = crate::watch::tests::pool(2);
+        let len = 2 * PAGE;
+        register(p, p as u64, len as u64);
+        let Some(copy) = find(p as u64, len as u64) else {
+            unregister(p, p as u64);
+            return; // no host GPU here
+        };
+        copy.update(p, len);
+        // SAFETY: (all title writes below) bytes of our pool.
+        unsafe { ((p + 100) as *mut u8).write_volatile(7) };
+        assert_eq!(copy.update(p + 64, 16), PAGE, "the written page, whole");
+        assert_eq!(copy.update(p + 4096, 16), 0, "taken: nothing to copy");
+        assert_eq!(copy.update(p + 64, 16), 0, "nor again");
+        assert_eq!(copy.read_host((p + 100) as u64 & !3, 1)[0].to_le_bytes()[0], 7);
+        // SAFETY: a byte of our pool.
+        unsafe { ((p + 100) as *mut u8).write_volatile(8) };
+        assert_eq!(copy.update(p + 64, 16), PAGE, "written again: copied again");
+        // Shaders' kept writes at the page's end: the refresh stops short.
+        copy.write_host((p + PAGE - 8) as u64, &[0xee]);
+        copy.keep_writes(p + PAGE - 16, 16);
+        // SAFETY: a byte of our pool.
+        unsafe { ((p + 100) as *mut u8).write_volatile(9) };
+        assert_eq!(copy.update(p + 64, 16), PAGE - 16, "up to the kept writes");
+        assert_eq!(copy.read_host((p + PAGE - 8) as u64, 1)[0].to_le_bytes()[0], 0xee, "kept");
+        unregister(p, p as u64);
     }
 
     /// Ranges shaders write far apart are kept apart (not the copy between

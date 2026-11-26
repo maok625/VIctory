@@ -523,6 +523,11 @@ impl Tracked {
         for p in pages {
             let (a, b) = ((p * PAGE).max(from), ((p + 1) * PAGE).min(to));
             let runs = if unmapped.contains(&p) { &mut zero } else { &mut copy };
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(
+                if whole.contains(&p) { crate::copystat::C::TakenWholeBytes } else { crate::copystat::C::TakenPartBytes },
+                (b - a) as u64,
+            );
             match runs.last_mut() {
                 Some((_, end)) if *end == a => *end = b,
                 _ => runs.push((a, b)),
