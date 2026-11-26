@@ -95,9 +95,42 @@ const PORTABLE_VIEWS: u32 = 1_000_000;
 /// each a device removal shortly after; #59).
 const DYNAMIC: u32 = 1 << 18;
 
-/// The dynamic slots of a heap whose host would not take [`DYNAMIC`] more
-/// (a capped heap, NVIDIA): the title's slots keep their room first.
+/// Minimum dynamic slots if even [`PORTABLE_VIEWS`] or [`DYNAMIC`] fails.
 const MIN_DYNAMIC: u32 = 1 << 16;
+
+/// Chooses the view heap size and `(kept, dynamic)` split for a host device.
+fn allocate_view_heap<H, E>(
+    count: u32,
+    mut make: impl FnMut(u32) -> Result<H, E>,
+) -> Result<(H, u32, u32), Option<E>> {
+    let views = victory_shader::emit::HEAP_VIEWS;
+    if let Some(total) = count.checked_add(DYNAMIC).map(|n| n.max(views))
+        && let Ok(heap) = make(total)
+    {
+        return Ok((heap, count, DYNAMIC));
+    }
+    if let Some(total) = count.checked_add(DYNAMIC)
+        && let Ok(heap) = make(total)
+    {
+        return Ok((heap, count, DYNAMIC));
+    }
+    if count.saturating_add(DYNAMIC) > PORTABLE_VIEWS
+        && let Ok(heap) = make(PORTABLE_VIEWS)
+    {
+        // On capped heaps (NVIDIA 1,000,000 limit), prioritize preserving the full
+        // `DYNAMIC` (2^18 = 262,144) pool to prevent table refusal in heavy scenes
+        // (#59, #747), leaving title slots up to 737,856 (past which views read null).
+        let kept = count.min(PORTABLE_VIEWS - DYNAMIC);
+        let dynamic = PORTABLE_VIEWS - kept;
+        return Ok((heap, kept, dynamic));
+    }
+    let Some(total) = count.checked_add(MIN_DYNAMIC) else {
+        return Err(None);
+    };
+    make(total)
+        .map(|heap| (heap, count, MIN_DYNAMIC))
+        .map_err(Some)
+}
 
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
@@ -138,10 +171,13 @@ impl HostHeap {
             })
             .flatten();
         // The larger dynamic range only where the host takes it on top of
-        // every title slot; else the smaller one, and the cap after that.
+        // every title slot; else try `count + DYNAMIC` (NVIDIA heaps that fit
+        // under 1,000,000), then cap at `PORTABLE_VIEWS` reserving the full
+        // `DYNAMIC` headroom (giving 737,856 title slots) before falling back
+        // to `MIN_DYNAMIC`.
         // Translated shaders clamp their indices below `HEAP_VIEWS` or
-        // `HEAP_SAMPLERS`: slots up to there exist and stay null.
-        let (views, samplers) = (victory_shader::emit::HEAP_VIEWS, victory_shader::emit::HEAP_SAMPLERS);
+        // `HEAP_SAMPLERS`: slots up to there exist and stay null on Tier 3.
+        let samplers = victory_shader::emit::HEAP_SAMPLERS;
         let (heap, count, extra) = if sampler {
             match make(count.max(samplers)) {
                 Ok(heap) => (heap, count, 0),
@@ -150,21 +186,25 @@ impl HostHeap {
                     return None;
                 }
             }
-        } else if let Ok(heap) = make((count + DYNAMIC).max(views)) {
-            (heap, count, DYNAMIC)
         } else {
-            // shortcut: a host that caps its heaps below `HEAP_VIEWS` (NVIDIA)
-            // faults on an index past them, as before the clamp.
-            match make(count + MIN_DYNAMIC) {
-                Ok(heap) => (heap, count, MIN_DYNAMIC),
-                Err(e) if count + MIN_DYNAMIC > PORTABLE_VIEWS => {
-                    // shortcut: descriptors past the host's limit are left
-                    // out; a title that reaches them needs remapping.
-                    tracing::warn!(error = %e, count, "host view heap capped at {PORTABLE_VIEWS}");
-                    (make(PORTABLE_VIEWS).ok()?, PORTABLE_VIEWS - MIN_DYNAMIC, MIN_DYNAMIC)
+            match allocate_view_heap(count, make) {
+                Ok((heap, kept, dynamic)) => {
+                    if kept < count || dynamic < DYNAMIC {
+                        tracing::warn!(
+                            requested = count,
+                            kept,
+                            dynamic,
+                            "host view heap capped below requested size"
+                        );
+                    }
+                    (heap, kept, dynamic)
                 }
-                Err(e) => {
+                Err(Some(e)) => {
                     tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
+                    return None;
+                }
+                Err(None) => {
+                    tracing::warn!(count, sampler, "no host descriptor heap");
                     return None;
                 }
             }
@@ -2219,11 +2259,27 @@ mod tests {
         let Some(heap) = HostHeap::new(false, 4) else {
             return; // no host GPU
         };
-        // Every index a translated shader can reach exists (clamped below
-        // `HEAP_VIEWS`, `HEAP_SAMPLERS`).
-        // SAFETY: plain queries of live heaps.
+        // Every index a translated shader can reach exists when the adapter
+        // allows `HEAP_VIEWS`; capped adapters (NVIDIA at 1,000,000) still keep
+        // the full `DYNAMIC` pool when `count + DYNAMIC` fits under the cap.
+        // SAFETY: plain heap capability probe and queries of live heaps.
         unsafe {
-            assert!(heap.heap.GetDesc().NumDescriptors >= victory_shader::emit::HEAP_VIEWS);
+            let full_supported = host()
+                .unwrap()
+                .device
+                .CreateDescriptorHeap::<ID3D12DescriptorHeap>(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    NumDescriptors: victory_shader::emit::HEAP_VIEWS,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                    NodeMask: 0,
+                })
+                .is_ok();
+            let views = heap.heap.GetDesc().NumDescriptors;
+            if full_supported {
+                assert!(views >= victory_shader::emit::HEAP_VIEWS);
+            } else {
+                assert!(views >= 4 + DYNAMIC);
+            }
             let samplers = HostHeap::new(true, 128).unwrap();
             assert!(samplers.heap.GetDesc().NumDescriptors >= victory_shader::emit::HEAP_SAMPLERS);
         }
@@ -2378,6 +2434,38 @@ mod tests {
         desc[10] = va as u32;
         desc[11] = (va >> 32) as u32;
         desc
+    }
+
+    #[test]
+    fn view_heap_allocation_scales_on_capped_hosts() {
+        let tier3 = |n: u32| Ok::<u32, ()>(n);
+        assert_eq!(allocate_view_heap(4, tier3), Ok((victory_shader::emit::HEAP_VIEWS, 4, DYNAMIC)));
+        assert_eq!(
+            allocate_view_heap(1 << 20, tier3),
+            Ok((victory_shader::emit::HEAP_VIEWS, 1 << 20, DYNAMIC))
+        );
+
+        let nvidia = |n: u32| (n <= PORTABLE_VIEWS).then_some(n).ok_or(());
+        // Small heaps under the 1M cap retain full `DYNAMIC` headroom.
+        assert_eq!(allocate_view_heap(4, nvidia), Ok((4 + DYNAMIC, 4, DYNAMIC)));
+        assert_eq!(
+            allocate_view_heap(500_000, nvidia),
+            Ok((500_000 + DYNAMIC, 500_000, DYNAMIC))
+        );
+        // Heaps exceeding `PORTABLE_VIEWS` with `DYNAMIC` reserve the full `DYNAMIC`
+        // pool (2^18 = 262,144) to prevent table refusal in heavy scenes (#59, #747),
+        // giving title slots up to 737,856 (PORTABLE_VIEWS - DYNAMIC).
+        assert_eq!(
+            allocate_view_heap(800_000, nvidia),
+            Ok((PORTABLE_VIEWS, PORTABLE_VIEWS - DYNAMIC, DYNAMIC))
+        );
+        assert_eq!(
+            allocate_view_heap(1_048_576, nvidia),
+            Ok((PORTABLE_VIEWS, PORTABLE_VIEWS - DYNAMIC, DYNAMIC))
+        );
+
+        let small_cap = |n: u32| (n <= 100_000).then_some(n).ok_or(());
+        assert_eq!(allocate_view_heap(4, small_cap), Ok((4 + MIN_DYNAMIC, 4, MIN_DYNAMIC)));
     }
 
     #[test]
