@@ -884,7 +884,7 @@ impl Shader {
         }
         if let Some(n) = self.wave_size {
             props.push(i32c(&mut self, 11));
-            let n = Some(i32c(&mut self, n));
+            let n = Some(i32c(&mut self, 32.min(n)));
             props.push(self.m.md_node(vec![n]));
         }
         let props =

@@ -404,8 +404,8 @@ fn run_permute_cs(wave64: bool, body: &[u32], want: &[u32]) {
             eprintln!("no SM 6.6 {label} device; skipped");
             continue;
         };
-        // Fixed WaveSize pipelines are refused by WARP, and WaveSize(64) by
-        // 32-lane hardware adapters.
+        // Fixed WaveSize pipelines are refused by WARP. WaveSize(64) shaders
+        // specify [WaveSize(32, 64)] to run on 32-lane hardware adapters.
         let Ok((root, pso)) = host.compute_pipeline(&shader) else {
             assert!(warp || wave64, "{label}: no pipeline for a wave of 32");
             eprintln!("{label}: no pipeline for a wave of {wave}; skipped");

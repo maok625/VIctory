@@ -2934,7 +2934,7 @@ impl<'a> Lower<'a> {
             118,
             &[flat],
         );
-        let wave = self.s.wave_size.expect("set with console lanes");
+        let wave = 32.min(self.s.wave_size.expect("set with console lanes"));
         let mask = self.s.m.i32(!(wave - 1));
         let base = self.s.m.bin(e, Bin::And, first, mask);
         let lane = self.lane_index();
