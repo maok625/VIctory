@@ -340,34 +340,36 @@ impl Shadow {
         let host = |a: usize, b: usize| unsafe { std::slice::from_raw_parts(self.data.add(a), b - a) };
         let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let segments = &mut before.0;
-        // The segments the range overlaps or touches.
-        let first = segments.partition_point(|(at, bytes)| at + bytes.len() < from);
-        let last = first + segments[first..].iter().take_while(|(at, _)| *at <= to).count();
-        if let [(at, bytes)] = &segments[first..last]
-            && *at <= from
-            && to <= at + bytes.len()
-        {
-            return;
+        let mut i = segments.partition_point(|(at, bytes)| at + bytes.len() <= from);
+        let mut cur = from;
+        #[cfg(feature = "diagnostics")]
+        let started = std::time::Instant::now();
+        #[cfg(feature = "diagnostics")]
+        let mut added = 0usize;
+        while cur < to {
+            let next_start = segments.get(i).map_or(to, |(at, _)| (*at).min(to));
+            if cur < next_start {
+                let mut gap = pooled(next_start - cur);
+                gap.extend_from_slice(host(cur, next_start));
+                #[cfg(feature = "diagnostics")]
+                {
+                    added += next_start - cur;
+                }
+                segments.insert(i, (cur, gap));
+                i += 1;
+                cur = next_start;
+            } else {
+                let seg_end = segments[i].0 + segments[i].1.len();
+                cur = cur.max(seg_end);
+                i += 1;
+            }
         }
-        let start = segments.get(first).filter(|_| first < last).map_or(from, |s| s.0.min(from));
-        let end = segments[first..last].last().map_or(to, |(at, bytes)| (at + bytes.len()).max(to));
         #[cfg(feature = "diagnostics")]
-        let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::SnapshotUs);
-        #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::SnapshotBytes, (end - start) as u64);
-        #[cfg(feature = "diagnostics")]
-        crate::copystat::snapshot(self.start, self.len, (end - start) as u64);
-        // Parts newly covered from the copy, the rest as it was taken.
-        let mut grown = pooled(end - start);
-        let mut at = start;
-        for (taken, bytes) in segments.drain(first..last) {
-            grown.extend_from_slice(host(at, taken));
-            grown.extend_from_slice(&bytes);
-            at = taken + bytes.len();
-            give_back(bytes);
+        if added > 0 {
+            crate::copystat::add(crate::copystat::C::SnapshotUs, started.elapsed().as_micros() as u64);
+            crate::copystat::add(crate::copystat::C::SnapshotBytes, added as u64);
+            crate::copystat::snapshot(self.start, self.len, added as u64);
         }
-        grown.extend_from_slice(host(at, end));
-        segments.insert(first, (start, grown));
     }
 
     /// `[address, address + len)` expanded outward to 64 KiB page
@@ -411,25 +413,33 @@ impl Shadow {
         let mut written = 0;
         let (from, to) = self.inside(address, len);
         let start = self.start as usize;
-        if let Some((taken, before)) = segments.iter().find(|(at, bytes)| *at <= from && to <= at + bytes.len())
-            && back
-            && from < to
-        {
-            let before = &before[from - taken..to - taken];
+        if back && from < to {
             #[cfg(feature = "diagnostics")]
             let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::CompareUs);
             // By 64 KiB piece: the copy compared with its bytes before the
             // submission, title memory read only where the GPU wrote.
             const PIECE: usize = 64 << 10;
-            let mut title = vec![0u8; PIECE];
+            let mut title = pooled(PIECE);
+            title.resize(PIECE, 0);
             let mut synced = Vec::new();
+            let mut seg_idx = segments.partition_point(|(at, bytes)| at + bytes.len() <= from);
             let mut at = from;
-            while at < to {
-                let n = (PIECE - (start + at) % PIECE).min(to - at);
+            while at < to && seg_idx < segments.len() {
+                let (taken, before) = &segments[seg_idx];
+                if *taken > at {
+                    at = (*taken).min(to);
+                    continue;
+                }
+                let seg_end = taken + before.len();
+                if at >= seg_end {
+                    seg_idx += 1;
+                    continue;
+                }
+                let n = (PIECE - (start + at) % PIECE).min(to - at).min(seg_end - at);
                 // SAFETY: inside the mapping; only the submitting thread
                 // writes it.
                 let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
-                let old = &before[at - from..at - from + n];
+                let old = &before[at - taken..at - taken + n];
                 let title = &mut title[..n];
                 // A whole piece is compared once per submission, whichever
                 // declared ranges overlap it: then what the GPU wrote there
@@ -452,6 +462,7 @@ impl Shadow {
                 }
                 at += n;
             }
+            give_back(title);
             // Pages made equal to title memory are current in the copy, so
             // our own write is not taken for the title's; others keep what
             // they had (a title write there shows at the next refresh).
@@ -1656,5 +1667,54 @@ pub(crate) mod tests {
         assert_eq!(m.take(5), Some(0));
         assert_eq!(pages(0x1_fff0, 0x20), 2, "a range across a page boundary");
         assert_eq!(pages(0x2_0000, 0x1_0000), 1);
+    }
+
+    /// Overlapping `writing` calls only snapshot uncovered gaps, and a
+    /// `copy_back` across multiple segments and 64 KiB chunks merges GPU writes
+    /// without clobbering concurrent title writes.
+    #[test]
+    fn overlapping_snapshots_never_recopy_and_cross_segment_copy_back() {
+        let p = crate::watch::tests::pool(2);
+        let len = 2 * PAGE;
+        register(p, p as u64, len as u64);
+        let Some(copy) = find(p as u64, len as u64) else {
+            unregister(p, p as u64);
+            return; // no host GPU here
+        };
+        let title = |at: usize| (p + at) as *mut u8;
+        // SAFETY: bytes of our pool.
+        unsafe {
+            title(10).write_volatile(0x01);
+            title(PAGE - 4).write_volatile(0x02);
+            title(PAGE + 4).write_volatile(0x03);
+            title(PAGE + 100).write_volatile(0x04);
+        }
+        copy.update(p, len);
+        copy.writing(p, PAGE - 16, false);
+        copy.writing(p + PAGE + 16, PAGE - 16, false);
+        copy.writing(p + 128, 2 * PAGE - 256, false);
+        copy.writing(p, len, false);
+        {
+            let before = copy.before.lock().unwrap();
+            let segs = &before.0;
+            for w in segs.windows(2) {
+                assert!(w[0].0 + w[0].1.len() <= w[1].0, "segments must stay sorted and disjoint");
+            }
+            let total: usize = segs.iter().map(|(_, v)| v.len()).sum();
+            assert_eq!(total, len, "overlapping writing calls must not re-copy bytes");
+        }
+        copy.write_host((p + 10) as u64, &[0xaa]);
+        copy.write_host((p + PAGE - 4) as u64, &[0xbb]);
+        copy.write_host((p + PAGE + 4) as u64, &[0xcc]);
+        // SAFETY: a byte of our pool.
+        unsafe { title(PAGE + 100).write_volatile(0x55) };
+        copy.copy_back(p, len);
+        // SAFETY: bytes of our pool.
+        let read = |at: usize| unsafe { title(at).read_volatile() };
+        assert_eq!(read(10), 0xaa);
+        assert_eq!(read(PAGE - 4), 0xbb);
+        assert_eq!(read(PAGE + 4), 0xcc);
+        assert_eq!(read(PAGE + 100), 0x55);
+        unregister(p, p as u64);
     }
 }
