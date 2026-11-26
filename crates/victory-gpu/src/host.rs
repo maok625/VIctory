@@ -2441,24 +2441,43 @@ impl Batch {
         #[cfg(feature = "diagnostics")]
         let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::FlushUs);
         self.pending.clear();
-        let mut total = 0;
-        for (shadow, from, to) in self.refreshes.drain(..) {
+        let work = std::mem::take(&mut self.refreshes);
+        // Each copy appears once (`pending` is keyed by its shadow), so the
+        // updates touch disjoint state (`Shadow` is Send + Sync and holds its
+        // own locks; the copies are ReadProcessMemory) and run on several
+        // threads. They are the submission's serial part: a world frame's
+        // ~80 copies move ~265 MB at 0.29 GB/s on one thread.
+        let done = std::sync::Mutex::new(Vec::with_capacity(work.len()));
+        crate::texture::in_parallel(work.len(), |i| {
+            let (shadow, from, to) = &work[i];
             let started = std::time::Instant::now();
-            let copied = shadow.update(from, to - from);
+            let copied = shadow.update(*from, *to - *from);
             let us = started.elapsed().as_micros() as u64;
             #[cfg(feature = "diagnostics")]
-            crate::copystat::range(from, to - from, us, 0);
+            crate::copystat::range(*from, *to - *from, us, 0);
             PREPARING[0].fetch_add(us, Ordering::Relaxed);
             PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+            done.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push((i, copied));
+        });
+        let mut total = 0;
+        let mut done = done.into_inner().unwrap_or_else(|e| e.into_inner());
+        done.sort_unstable_by_key(|&(i, _)| i);
+        for (i, copied) in done {
             total += copied;
+            let (shadow, from, to) = &work[i];
             // Kept: the union with what was current if they touch, else
             // the larger.
-            let key = std::sync::Arc::as_ptr(&shadow) as usize;
-            let (_, a, b) = self.current.entry(key).or_insert((shadow, from, to));
-            if from <= *b && *a <= to {
-                (*a, *b) = ((*a).min(from), (*b).max(to));
-            } else if to - from > *b - *a {
-                (*a, *b) = (from, to);
+            let key = std::sync::Arc::as_ptr(shadow) as usize;
+            let (_, a, b) = self
+                .current
+                .entry(key)
+                .or_insert_with(|| (shadow.clone(), *from, *to));
+            if *from <= *b && *a <= *to {
+                (*a, *b) = ((*a).min(*from), (*b).max(*to));
+            } else if *to - *from > *b - *a {
+                (*a, *b) = (*from, *to);
             }
         }
         total
@@ -3961,6 +3980,84 @@ mod batch {   // `mod tests` is already taken at the top of this file
         crate::shadow::unregister(p, p as u64);
         drop(copy);
         crate::watch::tests::free(p);
+    }
+
+    /// Many copies in one submission refresh on several threads and land the
+    /// same bytes one thread would copy. Synthetic only: pools of our own, no
+    /// game data.
+    #[test]
+    fn many_copies_refresh_in_parallel_and_copy_the_same_bytes() {
+        use crate::watch::PAGE;
+        const COPIES: usize = 16;
+        const PAGES: usize = 64;
+        let pools: Vec<usize> = (0..COPIES)
+            .map(|_| crate::watch::tests::pool(PAGES))
+            .collect();
+        let len = PAGES * PAGE;
+        for &p in &pools {
+            crate::shadow::register(p, p as u64, len as u64);
+        }
+        let Some(copies): Option<Vec<_>> = pools
+            .iter()
+            .map(|&p| crate::shadow::find(p as u64, len as u64))
+            .collect()
+        else {
+            for &p in &pools {
+                crate::shadow::unregister(p, p as u64);
+                crate::watch::tests::free(p);
+            }
+            return; // no host GPU here
+        };
+        let byte = |k: usize, i: usize| (k * PAGES + i) as u8;
+        let dirty = |v: u8| {
+            for (k, &p) in pools.iter().enumerate() {
+                for i in 0..PAGES {
+                    // SAFETY: our pool, guarded since the copy took it.
+                    unsafe { ((p + i * PAGE) as *mut u8).write_volatile(byte(k, i) ^ v) };
+                }
+            }
+        };
+        dirty(0);
+        let mut batch = Batch::default();
+        for (k, copy) in copies.iter().enumerate() {
+            batch.add(copy, pools[k], len);
+        }
+        let t0 = std::time::Instant::now();
+        assert_eq!(batch.flush(), COPIES * len, "all of every copy at first");
+        let parallel = t0.elapsed();
+        for (k, copy) in copies.iter().enumerate() {
+            for i in [0, PAGES / 2, PAGES - 1] {
+                assert_eq!(
+                    copy.read_host((pools[k] + i * PAGE) as u64, 1)[0],
+                    byte(k, i) as u32,
+                    "host copy holds the title's byte"
+                );
+            }
+        }
+        // The same work on one thread, for the measurement.
+        dirty(0xff);
+        let t0 = std::time::Instant::now();
+        let mut serial_total = 0;
+        for (k, copy) in copies.iter().enumerate() {
+            serial_total += copy.update(pools[k], len);
+        }
+        let serial = t0.elapsed();
+        assert_eq!(serial_total, COPIES * len);
+        for (k, copy) in copies.iter().enumerate() {
+            assert_eq!(
+                copy.read_host((pools[k] + (PAGES - 1) * PAGE) as u64, 1)[0],
+                (byte(k, PAGES - 1) ^ 0xff) as u32
+            );
+        }
+        eprintln!(
+            "flush of {COPIES} copies x {PAGES} pages ({} MiB): parallel {parallel:?}, serial {serial:?}",
+            COPIES * len / (1 << 20)
+        );
+        for (&p, copy) in pools.iter().zip(copies) {
+            crate::shadow::unregister(p, p as u64);
+            drop(copy);
+            crate::watch::tests::free(p);
+        }
     }
 }
 
