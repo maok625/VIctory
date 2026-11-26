@@ -1344,10 +1344,29 @@ fn make_marked(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> (Option<Kept>, O
 /// format of its family takes the texture's format unless it is castable.
 /// shortcut: such a view (sRGB of UNORM, say, on a texture the host made
 /// without castable formats) reads without its conversion.
-fn fits(texture: &ID3D12Resource, castable: &[u32], mut format: Option<&mut DXGI_FORMAT>, unordered: bool) -> bool {
+fn fits(
+    d: &D3D12_RESOURCE_DESC,
+    castable: &[u32],
+    format: Option<&mut DXGI_FORMAT>,
+    unordered: bool,
+) -> bool {
+    fits_with(
+        d,
+        castable,
+        format,
+        unordered,
+        crate::resource::rgb9e5_target_supported(),
+    )
+}
+
+fn fits_with(
+    d: &D3D12_RESOURCE_DESC,
+    castable: &[u32],
+    mut format: Option<&mut DXGI_FORMAT>,
+    unordered: bool,
+    rgb9e5_supported: bool,
+) -> bool {
     use crate::resource::{DEPTH_FORMATS, family};
-    // SAFETY: a live resource.
-    let d = unsafe { texture.GetDesc() };
     let allowed = if unordered {
         d.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 != 0
     } else {
@@ -1392,6 +1411,14 @@ fn fits(texture: &ID3D12Resource, castable: &[u32], mut format: Option<&mut DXGI
         once!(unordered, view, own, "view the host does not allow");
         return false;
     }
+    // A texture whose console format PC forbids as a render target or UAV
+    // was substituted (`resource::target_format`): views name its host format.
+    if view != own && crate::resource::target_format_with(view, rgb9e5_supported) == own {
+        if let Some(format) = format {
+            *format = d.Format;
+        }
+        return true;
+    }
     let cast = castable.contains(&view);
     if family(view) != family(own) && !cast {
         once!(view, own, "view format of another family");
@@ -1413,6 +1440,124 @@ fn fits(texture: &ID3D12Resource, castable: &[u32], mut format: Option<&mut DXGI
         *format = d.Format;
     }
     true
+}
+
+fn fits_texture_srv(
+    texture: &D3D12_RESOURCE_DESC,
+    castable: &[u32],
+    source_format: u32,
+    desc: &mut Option<D3D12_SHADER_RESOURCE_VIEW_DESC>,
+) -> bool {
+    fits_texture_srv_with(
+        texture,
+        castable,
+        source_format,
+        desc,
+        crate::resource::rgb9e5_target_supported(),
+    )
+}
+
+fn fits_texture_srv_with(
+    texture: &D3D12_RESOURCE_DESC,
+    castable: &[u32],
+    source_format: u32,
+    desc: &mut Option<D3D12_SHADER_RESOURCE_VIEW_DESC>,
+    rgb9e5_supported: bool,
+) -> bool {
+    if !fits_with(
+        texture,
+        castable,
+        desc.as_mut().map(|d| &mut d.Format),
+        false,
+        rgb9e5_supported,
+    ) {
+        return false;
+    }
+    if source_format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP.0 as u32
+        && texture.Format == DXGI_FORMAT_R16G16B16A16_FLOAT
+    {
+        if desc.is_none() {
+            *desc = default_texture_srv(texture);
+        }
+        if let Some(desc) = desc {
+            desc.Format = texture.Format;
+            // RGB9E5's missing source alpha reads as one, even when swizzled to RGB.
+            let mapping = &mut desc.Shader4ComponentMapping;
+            let mask = D3D12_SHADER_COMPONENT_MAPPING_MASK;
+            let alpha = D3D12_SHADER_COMPONENT_MAPPING_FROM_MEMORY_COMPONENT_3.0 as u32;
+            let one = D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_1.0 as u32;
+            for channel in 0..4 {
+                let shift = channel * D3D12_SHADER_COMPONENT_MAPPING_SHIFT;
+                if (*mapping >> shift) & mask == alpha {
+                    *mapping = (*mapping & !(mask << shift)) | (one << shift);
+                }
+            }
+        }
+    }
+    true
+}
+
+/// The full-texture default SRV, made explicit so its component mapping can change.
+fn default_texture_srv(texture: &D3D12_RESOURCE_DESC) -> Option<D3D12_SHADER_RESOURCE_VIEW_DESC> {
+    let mut desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+        Format: texture.Format,
+        Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+        ..Default::default()
+    };
+    let mips = u32::MAX;
+    let slices = u32::from(texture.DepthOrArraySize);
+    desc.ViewDimension = match texture.Dimension {
+        D3D12_RESOURCE_DIMENSION_TEXTURE1D if slices == 1 => {
+            desc.Anonymous.Texture1D = D3D12_TEX1D_SRV {
+                MipLevels: mips,
+                ..Default::default()
+            };
+            D3D12_SRV_DIMENSION_TEXTURE1D
+        }
+        D3D12_RESOURCE_DIMENSION_TEXTURE1D => {
+            desc.Anonymous.Texture1DArray = D3D12_TEX1D_ARRAY_SRV {
+                MipLevels: mips,
+                ArraySize: slices,
+                ..Default::default()
+            };
+            D3D12_SRV_DIMENSION_TEXTURE1DARRAY
+        }
+        D3D12_RESOURCE_DIMENSION_TEXTURE2D if texture.SampleDesc.Count > 1 && slices == 1 => {
+            desc.Anonymous.Texture2DMS = D3D12_TEX2DMS_SRV::default();
+            D3D12_SRV_DIMENSION_TEXTURE2DMS
+        }
+        D3D12_RESOURCE_DIMENSION_TEXTURE2D if texture.SampleDesc.Count > 1 => {
+            desc.Anonymous.Texture2DMSArray = D3D12_TEX2DMS_ARRAY_SRV {
+                ArraySize: slices,
+                ..Default::default()
+            };
+            D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY
+        }
+        D3D12_RESOURCE_DIMENSION_TEXTURE2D if slices == 1 => {
+            desc.Anonymous.Texture2D = D3D12_TEX2D_SRV {
+                MipLevels: mips,
+                ..Default::default()
+            };
+            D3D12_SRV_DIMENSION_TEXTURE2D
+        }
+        D3D12_RESOURCE_DIMENSION_TEXTURE2D => {
+            desc.Anonymous.Texture2DArray = D3D12_TEX2D_ARRAY_SRV {
+                MipLevels: mips,
+                ArraySize: slices,
+                ..Default::default()
+            };
+            D3D12_SRV_DIMENSION_TEXTURE2DARRAY
+        }
+        D3D12_RESOURCE_DIMENSION_TEXTURE3D => {
+            desc.Anonymous.Texture3D = D3D12_TEX3D_SRV {
+                MipLevels: mips,
+                ..Default::default()
+            };
+            D3D12_SRV_DIMENSION_TEXTURE3D
+        }
+        _ => return None,
+    };
+    Some(desc)
 }
 
 /// Whether a view without a description of `resource` (a title texture)
@@ -1495,6 +1640,8 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             if let Some(copy) = crate::resource::host_copy(resource) {
                 copy.viewed.store(true, std::sync::atomic::Ordering::Relaxed);
                 let texture = &copy.texture;
+                // SAFETY: a live host texture.
+                let host_desc = unsafe { texture.GetDesc() };
                 let mut desc = desc.as_ref().map(srv_desc);
                 if desc.is_none() && !default_view(resource) {
                     return None;
@@ -1505,7 +1652,12 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 {
                     desc.Format = DXGI_FORMAT(format as i32);
                 }
-                if !fits(texture, &copy.castable, desc.as_mut().map(|d| &mut d.Format), false) {
+                if !fits_texture_srv(
+                    &host_desc,
+                    &copy.castable,
+                    crate::resource::texture_format(resource),
+                    &mut desc,
+                ) {
                     return None;
                 }
                 // SAFETY: a live texture and a slot of our heap.
@@ -1539,7 +1691,8 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             let texture = &copy.texture;
             // A depth texture's unordered views write its twin.
             // SAFETY: a live resource.
-            if unsafe { texture.GetDesc() }.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0 != 0 {
+            let host_desc = unsafe { texture.GetDesc() };
+            if host_desc.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0 != 0 {
                 return crate::twin::uav(resource, &copy, desc.as_ref(), at)
                     .map(|twin| Some((twin, None)));
             }
@@ -1553,7 +1706,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             {
                 desc.Format = DXGI_FORMAT(format as i32);
             }
-            if !fits(texture, &copy.castable, desc.as_mut().map(|d| &mut d.Format), true) {
+            if !fits(&host_desc, &copy.castable, desc.as_mut().map(|d| &mut d.Format), true) {
                 return None;
             }
             // SAFETY: a live texture and a slot of our heap.
@@ -2211,6 +2364,127 @@ mod tests {
         assert_eq!(unsafe { past.read_unaligned() }, mark);
         // SAFETY: a plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    #[test]
+    fn rgb9e5_srv_preserves_explicit_component_mapping() {
+        let widened = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Format: DXGI_FORMAT_R16G16B16A16_FLOAT,
+            ..Default::default()
+        };
+        const ALWAYS: u32 = D3D12_SHADER_COMPONENT_MAPPING_ALWAYS_SET_BIT_AVOIDING_ZEROMEM_MISTAKES;
+        const FORCE_ONE: u32 = D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_1.0 as u32;
+        // Source A routed to output R, B to G, constant zero to B, and G to A.
+        let custom = ALWAYS | 3 | (2 << 3) | (4 << 6) | (1 << 9);
+        for (mapping, expected) in [
+            (custom, (custom & !7) | FORCE_ONE),
+            (
+                D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                ALWAYS | (1 << 3) | (2 << 6) | (FORCE_ONE << 9),
+            ),
+        ] {
+            let words = [67, 4, mapping, 0, 0, 1, 0, 0, 0, 0];
+            let mut desc = Some(srv_desc(&words));
+            assert!(fits_texture_srv_with(&widened, &[], 67, &mut desc, false));
+            let desc = desc.unwrap();
+            assert_eq!(desc.Format, DXGI_FORMAT_R16G16B16A16_FLOAT);
+            assert_eq!(desc.Shader4ComponentMapping, expected);
+        }
+    }
+
+    #[test]
+    fn rgb9e5_srv_uses_a_full_view_for_implicit_descriptions() {
+        let widened = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Format: DXGI_FORMAT_R16G16B16A16_FLOAT,
+            DepthOrArraySize: 3,
+            MipLevels: 4,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            ..Default::default()
+        };
+        let mut desc = None;
+        assert!(fits_texture_srv_with(&widened, &[], 67, &mut desc, false));
+        let desc = desc.unwrap();
+        assert_eq!(desc.Format, DXGI_FORMAT_R16G16B16A16_FLOAT);
+        assert_eq!(desc.ViewDimension, D3D12_SRV_DIMENSION_TEXTURE2DARRAY);
+        let one = D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_1.0 as u32;
+        let mask = D3D12_SHADER_COMPONENT_MAPPING_MASK << 9;
+        assert_eq!(
+            desc.Shader4ComponentMapping,
+            (D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING & !mask) | (one << 9)
+        );
+        // SAFETY: the view dimension above selects this union member.
+        let view = unsafe { desc.Anonymous.Texture2DArray };
+        assert_eq!((view.MostDetailedMip, view.MipLevels), (0, u32::MAX));
+        assert_eq!((view.FirstArraySlice, view.ArraySize), (0, 3));
+        assert_eq!(view.PlaneSlice, 0);
+    }
+
+    #[test]
+    fn rgb9e5_srv_infers_the_default_view_dimension() {
+        let check = |dimension, slices, samples, expected| {
+            let texture = D3D12_RESOURCE_DESC {
+                Dimension: dimension,
+                Format: DXGI_FORMAT_R16G16B16A16_FLOAT,
+                DepthOrArraySize: slices,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: samples,
+                    Quality: 0,
+                },
+                ..Default::default()
+            };
+            let view = default_texture_srv(&texture).unwrap();
+            assert_eq!(view.ViewDimension, expected);
+        };
+        let tex1d = D3D12_RESOURCE_DIMENSION_TEXTURE1D;
+        let tex2d = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        let tex3d = D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+        check(tex1d, 1, 1, D3D12_SRV_DIMENSION_TEXTURE1D);
+        check(tex1d, 3, 1, D3D12_SRV_DIMENSION_TEXTURE1DARRAY);
+        check(tex2d, 1, 1, D3D12_SRV_DIMENSION_TEXTURE2D);
+        check(tex2d, 3, 1, D3D12_SRV_DIMENSION_TEXTURE2DARRAY);
+        check(tex2d, 1, 4, D3D12_SRV_DIMENSION_TEXTURE2DMS);
+        check(tex2d, 3, 4, D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY);
+        check(tex3d, 3, 1, D3D12_SRV_DIMENSION_TEXTURE3D);
+    }
+
+    #[test]
+    fn rgb9e5_srv_does_not_change_native_texture_views() {
+        for format in [
+            DXGI_FORMAT_R9G9B9E5_SHAREDEXP,
+            DXGI_FORMAT_R16G16B16A16_FLOAT,
+        ] {
+            let texture = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Format: format,
+                ..Default::default()
+            };
+            let words = [
+                format.0 as u32,
+                4,
+                D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                0,
+                0,
+                1,
+                0,
+                0,
+                0,
+                0,
+            ];
+            let mut desc = Some(srv_desc(&words));
+            assert!(fits_texture_srv(&texture, &[], format.0 as u32, &mut desc));
+            assert_eq!(
+                desc.unwrap().Shader4ComponentMapping,
+                D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING
+            );
+            let mut desc = None;
+            assert!(fits_texture_srv(&texture, &[], format.0 as u32, &mut desc));
+            assert!(desc.is_none());
+        }
     }
 
     /// Dynamic slots stay taken until given back, and runs do not wrap.

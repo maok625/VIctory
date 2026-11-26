@@ -642,6 +642,21 @@ extern "system" fn copy_buffer_region(
     let _ = (this, dst, dst_offset, src, src_offset, len);
 }
 
+/// Whether a host copy between `dst_format` and `src_format` would be an
+/// invalid D3D12 copy because at least one side was widened (e.g.
+/// `R9G9B9E5_SHAREDEXP` -> `R16G16B16A16_FLOAT`) and the host formats are
+/// no longer in the same family.
+#[cfg(any(windows, test))]
+fn widened_copy_mismatch(
+    dst_widened: bool,
+    src_widened: bool,
+    dst_format: u32,
+    src_format: u32,
+) -> bool {
+    (dst_widened || src_widened)
+        && crate::resource::family(dst_format) != crate::resource::family(src_format)
+}
+
 extern "system" fn copy_resource(this: This, dst: This, src: This) {
     #[cfg(windows)]
     {
@@ -652,6 +667,29 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             crate::resource::host_resource(dst),
             crate::resource::host_resource(src),
         ) {
+            // SAFETY: live host textures.
+            let (to_fmt, from_fmt) = unsafe {
+                (
+                    to.GetDesc().Format.0 as u32,
+                    from.GetDesc().Format.0 as u32,
+                )
+            };
+            if widened_copy_mismatch(
+                crate::resource::is_widened(dst),
+                crate::resource::is_widened(src),
+                to_fmt,
+                from_fmt,
+            ) {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| {
+                    tracing::warn!(
+                        dst_format = to_fmt,
+                        src_format = from_fmt,
+                        "skipping mismatched-format CopyResource involving widened texture"
+                    );
+                });
+                return;
+            }
             if crate::texture::title_written(&from) {
                 crate::texture::upload(list, src, &from);
             }
@@ -718,11 +756,26 @@ extern "system" fn copy_texture_region(
             }
             return;
         };
+        // SAFETY: a live host texture.
+        let to_fmt = unsafe { to.GetDesc() }.Format.0 as u32;
+        let dst_widened = crate::resource::is_widened(dst.resource);
         let mut from = src;
         let _upload; // keeps the source alive while this call records it
         #[cfg(feature = "diagnostics")]
         let mut read = None;
         if src.kind == FOOTPRINT {
+            let src_fmt = crate::resource::pc_format(src.footprint.format);
+            if widened_copy_mismatch(dst_widened, false, to_fmt, src_fmt) {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| {
+                    tracing::warn!(
+                        dst_format = to_fmt,
+                        src_format = src_fmt,
+                        "skipping mismatched-format CopyTextureRegion from footprint into widened texture"
+                    );
+                });
+                return;
+            }
             let (Some(host), Some(bytes)) = (crate::host::host(), src.footprint.bytes()) else {
                 return;
             };
@@ -747,6 +800,24 @@ extern "system" fn copy_texture_region(
             let Some(texture) = crate::resource::host_resource(src.resource) else {
                 return;
             };
+            // SAFETY: a live host texture.
+            let from_fmt = unsafe { texture.GetDesc() }.Format.0 as u32;
+            if widened_copy_mismatch(
+                dst_widened,
+                crate::resource::is_widened(src.resource),
+                to_fmt,
+                from_fmt,
+            ) {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| {
+                    tracing::warn!(
+                        dst_format = to_fmt,
+                        src_format = from_fmt,
+                        "skipping mismatched-format CopyTextureRegion involving widened texture"
+                    );
+                });
+                return;
+            }
             if crate::texture::title_written(&texture) {
                 crate::texture::upload(list, src.resource, &texture);
             }
@@ -2045,5 +2116,17 @@ mod tests {
         for object in [buffer, list, allocator] {
             assert_eq!(release(object), 0);
         }
+    }
+
+    #[test]
+    fn widened_copy_mismatch_guards_only_widened_cross_family_copies() {
+        // Widened RGBA16F (10) vs native RGB9E5 (67) or R32_UINT (42): mismatched.
+        assert!(widened_copy_mismatch(true, false, 10, 67));
+        assert!(widened_copy_mismatch(false, true, 67, 10));
+        assert!(widened_copy_mismatch(true, false, 10, 42));
+        // Both widened RGBA16F (10): matching family, copy allowed.
+        assert!(!widened_copy_mismatch(true, true, 10, 10));
+        // Neither widened (e.g. native R32_UINT -> RGB9E5): unchanged, copy allowed.
+        assert!(!widened_copy_mismatch(false, false, 67, 42));
     }
 }
