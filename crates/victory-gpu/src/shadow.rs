@@ -63,9 +63,124 @@ fn writeback_merge_matches_bytewise_oracle() {
     }
 }
 
+/// CPU-side backing for VRAM-resident [`Shadow`] copies (`alloc_zeroed` pages
+/// demand-committed by the OS, avoiding extra D3D12 `L0` heap resources).
+pub(crate) struct CpuMem {
+    ptr: *mut u8,
+    layout: Option<std::alloc::Layout>,
+    _shared: Option<ID3D12Resource>,
+}
+
+// SAFETY: page-backed process memory owned via Arc; written/read by Shadow's synchronized paths.
+unsafe impl Send for CpuMem {}
+// SAFETY: as above.
+unsafe impl Sync for CpuMem {}
+
+impl CpuMem {
+    fn new(size: u64) -> Option<Arc<Self>> {
+        let layout = std::alloc::Layout::from_size_align(size.max(1) as usize, 64).ok()?;
+        // SAFETY: non-zero layout; zeroed by allocator.
+        let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+        if ptr.is_null() {
+            None
+        } else {
+            Some(Arc::new(Self { ptr, layout: Some(layout), _shared: None }))
+        }
+    }
+
+    fn wrap_shared(res: ID3D12Resource) -> Arc<Self> {
+        Arc::new(Self {
+            ptr: std::ptr::null_mut(),
+            layout: None,
+            _shared: Some(res),
+        })
+    }
+
+    fn ptr(&self) -> *mut u8 {
+        self.ptr
+    }
+}
+
+impl Drop for CpuMem {
+    fn drop(&mut self) {
+        if let Some(layout) = self.layout {
+            // SAFETY: allocated with `layout` via `alloc_zeroed`.
+            unsafe { std::alloc::dealloc(self.ptr, layout) };
+        }
+    }
+}
+
+pub(crate) struct VramCopy {
+    pub(crate) dst: ID3D12Resource,
+    pub(crate) dst_off: u64,
+    pub(crate) src_ptr: usize,
+    pub(crate) len: u64,
+    pub(crate) _cpu: Arc<CpuMem>,
+}
+
+static VRAM_UPLOADS: Mutex<Vec<VramCopy>> = Mutex::new(Vec::new());
+static VRAM_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn try_vram_shadow(size: u64, max_single: u64) -> Option<ID3D12Resource> {
+    if size > max_single {
+        return None;
+    }
+    let h = host()?;
+    let budget = h.vram_shadow_budget();
+    if budget == 0 {
+        return None;
+    }
+    let cur = VRAM_BYTES.load(std::sync::atomic::Ordering::Relaxed);
+    if cur + size > budget {
+        return None;
+    }
+    let buf = h.default_uav_buffer(size)?;
+    VRAM_BYTES.fetch_add(size, std::sync::atomic::Ordering::Relaxed);
+    Some(buf)
+}
+
+struct Backing {
+    buffer: ID3D12Resource,
+    cpu: Arc<CpuMem>,
+    vram: bool,
+    alloc_size: u64,
+    data: *mut u8,
+    gpu: u64,
+}
+
+fn alloc_backing(size: u64, max_vram_single: u64, arena_owned: bool, label: impl FnOnce() -> String) -> Option<Backing> {
+    let h = host()?;
+    let (buffer, cpu, data, vram) = if let Some(v) = try_vram_shadow(size, max_vram_single) {
+        let cpu = CpuMem::new(size)?;
+        let data = cpu.ptr();
+        (v, cpu, data, true)
+    } else {
+        let (ram, data) = h.shared_buffer(size)?;
+        (ram.clone(), CpuMem::wrap_shared(ram), data, false)
+    };
+    crate::host::name(&buffer, label);
+    // SAFETY: a live buffer.
+    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+    Some(Backing {
+        buffer,
+        cpu,
+        vram,
+        alloc_size: if arena_owned { 0 } else { size },
+        data,
+        gpu,
+    })
+}
+
+pub(crate) fn take_vram_uploads() -> Vec<VramCopy> {
+    std::mem::take(&mut *VRAM_UPLOADS.lock().unwrap_or_else(|e| e.into_inner()))
+}
+
 /// A title buffer's host copy.
 pub(crate) struct Shadow {
     pub(crate) buffer: ID3D12Resource,
+    cpu: Arc<CpuMem>,
+    vram: bool,
+    alloc_size: u64,
     data: *mut u8,
     gpu: u64,
     /// Where the title buffer starts and how long it is.
@@ -154,6 +269,13 @@ impl Shadow {
     pub(crate) fn read_host(&self, address: u64, n: usize) -> Vec<u32> {
         let at = (address - self.start) as usize;
         assert!(at + 4 * n <= self.len as usize);
+        if self.vram
+            && let Some(h) = host()
+        {
+            h.flush_test_vram_uploads();
+            // SAFETY: `self.data.add(at)` is valid for `4 * n` bytes.
+            h.test_readback_buffer(&self.buffer, self.base + at as u64, unsafe { self.data.add(at) }, (4 * n) as u64);
+        }
         // SAFETY: inside the mapping (checked); the GPU is done with it.
         unsafe { std::slice::from_raw_parts(self.data.add(at).cast::<u32>(), n).to_vec() }
     }
@@ -166,6 +288,12 @@ impl Shadow {
         assert!(at + bytes.len() <= self.len as usize);
         // SAFETY: inside the mapping (checked).
         unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.data.add(at), bytes.len()) };
+        if self.vram
+            && let Some(h) = host()
+        {
+            h.flush_test_vram_uploads();
+            h.test_upload_buffer(&self.buffer, self.base + at as u64, bytes.as_ptr(), bytes.len() as u64);
+        }
     }
 
     /// Up to 64 bytes of the copy at title address `address`, as floats, and
@@ -243,19 +371,22 @@ impl Shadow {
         list.defer_refresh(self, address as usize, len as usize);
     }
 
-    fn new(buffer: ID3D12Resource, data: *mut u8, gpu: u64, start: u64, len: u64) -> Arc<Shadow> {
-        Shadow::new_at(buffer, data, gpu, start, len, None)
+    fn new(b: Backing, start: u64, len: u64) -> Arc<Shadow> {
+        Shadow::new_at(b, start, len, None)
     }
 
-    /// [`Shadow::new`] of a copy in a run of a shared buffer (`data` and
-    /// `gpu` are the run's).
-    fn new_at(buffer: ID3D12Resource, data: *mut u8, gpu: u64, start: u64, len: u64, slice: Option<Slice>) -> Arc<Shadow> {
+    /// [`Shadow::new`] of a copy in a run of a shared buffer (`b.data` and
+    /// `b.gpu` are the run's).
+    fn new_at(b: Backing, start: u64, len: u64, slice: Option<Slice>) -> Arc<Shadow> {
         let tracked = crate::watch::track_copy(start as usize, len as usize, true);
         let marks = tracked.as_ref().and_then(|_| marks().take(pages(start, len)));
         let shadow = Arc::new(Shadow {
-            buffer,
-            data,
-            gpu,
+            buffer: b.buffer,
+            cpu: b.cpu,
+            vram: b.vram,
+            alloc_size: b.alloc_size,
+            data: b.data,
+            gpu: b.gpu,
             start,
             len,
             tracked,
@@ -635,6 +766,7 @@ impl Shadow {
         for (a, b) in unmapped {
             // SAFETY: inside the mapping (`take_split` cuts to the buffer).
             unsafe { self.data.add(a - start).write_bytes(0, b - a) };
+            self.queue_vram_upload((a - start) as u64, (b - a) as u64);
             sync_before(a, b);
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::Unmapped, (b - a) as u64);
@@ -676,6 +808,26 @@ impl Shadow {
         to - from
     }
 
+    pub(crate) fn vram_readback(&self) -> Option<(usize, u64, u64, u64)> {
+        self.vram.then_some((self.data as usize, self.base, self.start, self.len))
+    }
+
+    fn queue_vram_upload(&self, off: u64, len: u64) {
+        if self.vram && len > 0 {
+            VRAM_UPLOADS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(VramCopy {
+                    dst: self.buffer.clone(),
+                    dst_off: self.base + off,
+                    // SAFETY: `off` is inside `[0, self.len)` of `self.data`.
+                    src_ptr: unsafe { self.data.add(off as usize) } as usize,
+                    len,
+                    _cpu: self.cpu.clone(),
+                });
+        }
+    }
+
     /// Copies title memory `[from, to)`, cut to the buffer, into the copy.
     fn copy(&self, from: usize, to: usize) -> usize {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
@@ -683,6 +835,7 @@ impl Shadow {
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).
         let at = unsafe { self.data.add(from - start) };
         crate::host::copy_mapped(at, from as *const u8, to - from, false);
+        self.queue_vram_upload((from - start) as u64, (to - from) as u64);
         if let Some(t) = &self.tracked {
             // SAFETY: `to - from` bytes inside the mapping, just copied.
             t.refreshed(from, unsafe { std::slice::from_raw_parts(at, to - from) });
@@ -695,6 +848,8 @@ impl Drop for Shadow {
     fn drop(&mut self) {
         if let Some(slice) = self.slice {
             arena().give_back(slice);
+        } else if self.vram && self.alloc_size > 0 {
+            VRAM_BYTES.fetch_sub(self.alloc_size, std::sync::atomic::Ordering::Relaxed);
         }
         if let Some(base) = self.marks {
             let mut m = marks();
@@ -771,6 +926,8 @@ impl Marks {
 /// as dwords) and host GPU address.
 struct Bitmap {
     _buffer: ID3D12Resource,
+    vram: Option<ID3D12Resource>,
+    bytes: u64,
     data: usize,
     gpu: u64,
 }
@@ -791,19 +948,48 @@ fn bitmap(memory: bool) -> Option<&'static Bitmap> {
             // Written pages, then one read mark per heap index.
             let bits = victory_shader::emit::VIEW_READS + victory_shader::emit::HEAP_VIEWS;
             let bytes = u64::from(bits / 8);
-            let (buffer, data) = host()?.shared_buffer(bytes)?;
+            let h = host()?;
+            let (buffer, data) = h.shared_buffer(bytes)?;
             crate::host::name(&buffer, || "views' written pages and read slots".into());
             // SAFETY: our mapped buffer of `bytes` bytes.
             unsafe { std::ptr::write_bytes(data, 0, bytes as usize) };
+            let vram = (!h.is_uma()).then(|| h.default_uav_buffer(bytes)).flatten();
             // SAFETY: a live buffer.
-            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+            let gpu = unsafe { vram.as_ref().unwrap_or(&buffer).GetGPUVirtualAddress() };
             Some(Bitmap {
                 _buffer: buffer,
+                vram,
+                bytes,
                 data: data as usize,
                 gpu,
             })
         })
         .as_ref()
+}
+
+pub(crate) fn has_vram_bitmaps() -> bool {
+    [false, true]
+        .into_iter()
+        .filter_map(bitmap)
+        .any(|b| b.vram.is_some())
+}
+
+pub(crate) fn sync_bitmaps_pre(list: &windows::Win32::Graphics::Direct3D12::ID3D12GraphicsCommandList) {
+    for b in [false, true].into_iter().filter_map(bitmap) {
+        if let Some(vram) = &b.vram {
+            // SAFETY: live bitmap buffers of `b.bytes`.
+            unsafe { list.CopyBufferRegion(vram, 0, &b._buffer, 0, b.bytes) };
+        }
+    }
+}
+
+pub(crate) fn sync_bitmaps_post(list: &windows::Win32::Graphics::Direct3D12::ID3D12GraphicsCommandList) {
+    for b in [false, true].into_iter().filter_map(bitmap) {
+        if let Some(vram) = &b.vram {
+            // SAFETY: live bitmap buffers of `b.bytes`.
+            unsafe { list.CopyBufferRegion(&b._buffer, 0, vram, 0, b.bytes) };
+        }
+    }
 }
 
 /// The host GPU address of the buffer views' written-pages bitmap, for the
@@ -1027,10 +1213,10 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
         let len = entry.end - key.0;
         // Rounded up so that views ending in the buffer's last 256 bytes fit.
         // Shaders write some buffers (unordered access), so not upload memory.
-        let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(1 << 16))?;
-        crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
-        // SAFETY: a live buffer.
-        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        let alloc_size = len.next_multiple_of(1 << 16);
+        let backing = alloc_backing(alloc_size, 128 << 20, false, || {
+            format!("title buffer {:#x}+{len:#x}", key.0)
+        })?;
         if len >= 16 << 20 {
             tracing::info!(
                 start = format_args!("{:#x}", key.0),
@@ -1044,7 +1230,7 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
                 "buffer copied to the host"
             );
         }
-        entry.shadow = Some(Shadow::new(buffer, data, gpu, key.0, len));
+        entry.shadow = Some(Shadow::new(backing, key.0, len));
         changed();
     }
     entry.shadow.clone()
@@ -1067,16 +1253,15 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     if let Some(shadow) = map.get(&(start, len)) {
         return Some(shadow.clone());
     }
-    let (buffer, data) = host()?.shared_buffer(len)?;
-    crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
-    // SAFETY: a live buffer.
-    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+    let backing = alloc_backing(len, 128 << 20, false, || {
+        format!("title memory {start:#x}+{len:#x}")
+    })?;
     tracing::debug!(
         start = format_args!("{start:#x}"),
         len,
         "loose memory copied to the host"
     );
-    let shadow = Shadow::new(buffer, data, gpu, start, len);
+    let shadow = Shadow::new(backing, start, len);
     map.insert((start, len), shadow.clone());
     changed();
     Some(shadow)
@@ -1122,8 +1307,8 @@ pub(crate) fn log_views(frames: f64) {
     let (chunks, held) = {
         let a = arena();
         // SAFETY: live buffers.
-        let size = |c: &(ID3D12Resource, usize, u64, BTreeMap<u64, u64>)| unsafe { c.0.GetDesc() }.Width;
-        let held: u64 = a.chunks.iter().map(|c| size(c) - c.3.values().sum::<u64>()).sum();
+        let size = |c: &Chunk| unsafe { c.buffer.GetDesc() }.Width;
+        let held: u64 = a.chunks.iter().map(|c| size(c) - c.free.values().sum::<u64>()).sum();
         (a.chunks.len(), held)
     };
     if asks > 0 {
@@ -1158,8 +1343,8 @@ fn exact(address: u64, len: u64, element: u64) -> Option<Arc<Shadow>> {
         *prune_at = (2 * map.len()).max(1024);
     }
     // A run of a shared buffer, its start a whole number of elements in.
-    let (buffer, data, gpu, slice) = arena().take(len, element)?;
-    let shadow = Shadow::new_at(buffer, data, gpu, address, len, Some(slice));
+    let (backing, slice) = arena().take(len, element)?;
+    let shadow = Shadow::new_at(backing, address, len, Some(slice));
     map.insert((address, len, element), Arc::downgrade(&shadow));
     #[cfg(feature = "diagnostics")]
     {
@@ -1185,11 +1370,20 @@ struct Slice {
 /// buffer of their own each cost a kernel call to make and one to free on
 /// the title's threads and the submitting one (300-820 a frame), and 64 KiB
 /// of memory each (~5,000 live).
+struct Chunk {
+    buffer: ID3D12Resource,
+    cpu: Arc<CpuMem>,
+    vram: bool,
+    data: usize,
+    gpu: u64,
+    free: BTreeMap<u64, u64>,
+}
+
 #[derive(Default)]
 struct Arena {
     /// Each buffer, its mapping and host address, and its free runs
     /// (offset → bytes).
-    chunks: Vec<(ID3D12Resource, usize, u64, BTreeMap<u64, u64>)>,
+    chunks: Vec<Chunk>,
 }
 
 /// Bytes of each arena buffer (a larger copy gets one of its size).
@@ -1204,7 +1398,7 @@ fn arena() -> std::sync::MutexGuard<'static, Arena> {
 impl Arena {
     /// A run of `len` bytes starting at a multiple of `element` (and of 256)
     /// in a shared buffer: the buffer, the run's mapping and host address.
-    fn take(&mut self, len: u64, element: u64) -> Option<(ID3D12Resource, *mut u8, u64, Slice)> {
+    fn take(&mut self, len: u64, element: u64) -> Option<(Backing, Slice)> {
         let gcd = |mut a: u64, mut b: u64| {
             while b != 0 {
                 (a, b) = (b, a % b);
@@ -1219,22 +1413,26 @@ impl Arena {
                 (start + len <= at + n).then_some((at, n, start))
             })
         };
-        let found = self.chunks.iter().enumerate().find_map(|(c, chunk)| fits(&chunk.3).map(|f| (c, f)));
+        let found = self.chunks.iter().enumerate().find_map(|(c, chunk)| fits(&chunk.free).map(|f| (c, f)));
         let (chunk, (at, n, start)) = match found {
             Some(found) => found,
             None => {
                 let size = CHUNK.max((len + align).next_multiple_of(1 << 16));
-                let (buffer, data) = host()?.shared_buffer(size)?;
-                crate::host::name(&buffer, || format!("title views {size:#x}"));
-                // SAFETY: a live buffer.
-                let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+                let b = alloc_backing(size, CHUNK, true, || format!("title views {size:#x}"))?;
                 let free = BTreeMap::from([(0, size)]);
-                self.chunks.push((buffer, data as usize, gpu, free));
+                self.chunks.push(Chunk {
+                    buffer: b.buffer,
+                    cpu: b.cpu,
+                    vram: b.vram,
+                    data: b.data as usize,
+                    gpu: b.gpu,
+                    free,
+                });
                 let c = self.chunks.len() - 1;
-                (c, fits(&self.chunks[c].3)?)
+                (c, fits(&self.chunks[c].free)?)
             }
         };
-        let (buffer, data, gpu, free) = &mut self.chunks[chunk];
+        let Chunk { buffer, cpu, vram, data, gpu, free } = &mut self.chunks[chunk];
         free.remove(&at);
         if start > at {
             free.insert(at, start - at);
@@ -1243,12 +1441,22 @@ impl Arena {
             free.insert(start + len, at + n - start - len);
         }
         let slice = Slice { chunk, offset: start, len };
-        Some((buffer.clone(), (*data + start as usize) as *mut u8, *gpu + start, slice))
+        let backing = Backing {
+            buffer: buffer.clone(),
+            cpu: cpu.clone(),
+            vram: *vram,
+            alloc_size: 0,
+            // SAFETY: `start` is within the chunk's allocation.
+            data: unsafe { (*data as *mut u8).add(start as usize) },
+            gpu: *gpu + start,
+        };
+        Some((backing, slice))
     }
 
     /// A run goes back, joined to its free neighbours.
     fn give_back(&mut self, slice: Slice) {
-        let Some((_, _, _, free)) = self.chunks.get_mut(slice.chunk) else { return };
+        let Some(chunk) = self.chunks.get_mut(slice.chunk) else { return };
+        let free = &mut chunk.free;
         let (mut at, mut n) = (slice.offset, slice.len);
         if let Some((&before, &m)) = free.range(..at).next_back()
             && before + m == at
@@ -1423,9 +1631,9 @@ pub(crate) mod tests {
             return; // no host GPU here
         }
         let mut arena = Arena::default();
-        let (_, _, _, a) = arena.take(100, 456).unwrap();
-        let (_, _, _, b) = arena.take(5000, 16).unwrap();
-        let (_, _, _, c) = arena.take(4, 4).unwrap();
+        let (_, a) = arena.take(100, 456).unwrap();
+        let (_, b) = arena.take(5000, 16).unwrap();
+        let (_, c) = arena.take(4, 4).unwrap();
         assert!(a.offset % 456 == 0 && a.offset % 256 == 0 && b.offset % 256 == 0);
         let mut runs = [a, b, c].map(|s| (s.offset, s.offset + s.len));
         runs.sort_unstable();
@@ -1434,9 +1642,9 @@ pub(crate) mod tests {
             arena.give_back(s);
         }
         assert_eq!(arena.chunks.len(), 1);
-        assert_eq!(arena.chunks[0].3.len(), 1, "one free run again");
+        assert_eq!(arena.chunks[0].free.len(), 1, "one free run again");
         // Larger than a buffer: one of its own.
-        let (_, _, _, d) = arena.take(CHUNK + 1, 4).unwrap();
+        let (_, d) = arena.take(CHUNK + 1, 4).unwrap();
         assert_eq!((arena.chunks.len(), d.chunk), (2, 1));
     }
 

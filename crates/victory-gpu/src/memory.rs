@@ -106,6 +106,7 @@ struct Layout {
 /// A 256 KiB dirty-page bitmap buffer kept zeroed while in [`BITMAP_POOL`].
 struct Bitmap {
     _resource: ID3D12Resource,
+    vram: Option<ID3D12Resource>,
     data: usize,
     gpu: u64,
 }
@@ -127,14 +128,17 @@ impl Bitmap {
         if let Some(bitmap) = BITMAP_POOL.lock().unwrap_or_else(|e| e.into_inner()).pop() {
             return Some(bitmap);
         }
-        let (resource, data) = crate::host::host()?.shared_buffer(BITMAP_BYTES)?;
+        let h = crate::host::host()?;
+        let (resource, data) = h.shared_buffer(BITMAP_BYTES)?;
         crate::host::name(&resource, || "title memory written pages".into());
         // SAFETY: `data` is a newly mapped shared buffer of at least `BITMAP_WORDS` dwords.
         unsafe { std::ptr::write_bytes(data.cast::<u32>(), 0, BITMAP_WORDS) };
-        // SAFETY: `resource` is a live D3D12 buffer.
-        let gpu = unsafe { resource.GetGPUVirtualAddress() };
+        let vram = (!h.is_uma()).then(|| h.default_uav_buffer(BITMAP_BYTES)).flatten();
+        // SAFETY: `resource` / `vram` is a live D3D12 buffer.
+        let gpu = unsafe { vram.as_ref().unwrap_or(&resource).GetGPUVirtualAddress() };
         Some(Self {
             _resource: resource,
+            vram,
             data: data as usize,
             gpu,
         })
@@ -198,6 +202,57 @@ impl Drop for PooledBitmap {
     }
 }
 
+static ACTIVE_BITMAPS: Mutex<Vec<(ID3D12Resource, ID3D12Resource)>> = Mutex::new(Vec::new());
+
+fn zeros_upload() -> Option<ID3D12Resource> {
+    static ZEROS: std::sync::OnceLock<Option<ID3D12Resource>> = std::sync::OnceLock::new();
+    ZEROS
+        .get_or_init(|| {
+            let (buf, data) = crate::host::host()?.upload_buffer(BITMAP_BYTES)?;
+            // SAFETY: mapped upload buffer of `BITMAP_BYTES`.
+            unsafe { std::ptr::write_bytes(data, 0, BITMAP_BYTES as usize) };
+            Some(buf)
+        })
+        .clone()
+}
+
+pub(crate) fn needs_vram_pre() -> bool {
+    !ACTIVE_BITMAPS.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+        || shared().iter().any(|(_, s)| s.dirty && s.vram.is_some())
+}
+
+pub(crate) fn needs_vram_post() -> bool {
+    !ACTIVE_BITMAPS.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+}
+
+pub(crate) fn sync_vram_pre(list: &windows::Win32::Graphics::Direct3D12::ID3D12GraphicsCommandList) {
+    let bytes = TABLE_DWORDS as u64 * 4;
+    for (_, s) in shared().iter_mut() {
+        if s.dirty {
+            s.dirty = false;
+            if let Some(vram) = &s.vram {
+                // SAFETY: live table buffers of `bytes`.
+                unsafe { list.CopyBufferRegion(vram, 0, &s.table, 0, bytes) };
+            }
+        }
+    }
+    if let Some(zeros) = zeros_upload() {
+        let active = ACTIVE_BITMAPS.lock().unwrap_or_else(|e| e.into_inner());
+        for (vram, _) in active.iter() {
+            // SAFETY: live buffers of `BITMAP_BYTES`.
+            unsafe { list.CopyBufferRegion(vram, 0, &zeros, 0, BITMAP_BYTES) };
+        }
+    }
+}
+
+pub(crate) fn sync_vram_post(list: &windows::Win32::Graphics::Direct3D12::ID3D12GraphicsCommandList) {
+    let mut active = ACTIVE_BITMAPS.lock().unwrap_or_else(|e| e.into_inner());
+    for (vram, ram) in active.drain(..) {
+        // SAFETY: live buffers of `BITMAP_BYTES`.
+        unsafe { list.CopyBufferRegion(&ram, 0, &vram, 0, BITMAP_BYTES) };
+    }
+}
+
 /// A view heap's page table, shared by every list using title memory with
 /// the heap bound, and the view pairs of the copies it names.
 struct Shared {
@@ -205,6 +260,8 @@ struct Shared {
     /// address is another).
     host: usize,
     table: ID3D12Resource,
+    vram: Option<ID3D12Resource>,
+    dirty: bool,
     data: usize,
     gpu: u64,
     /// The pair of null views entries without a copy name.
@@ -481,15 +538,19 @@ impl Shared {
     /// submission that uses it).
     fn new(heap: &HostHeap) -> Option<Shared> {
         let bytes = TABLE_DWORDS as u64 * 4;
-        let (table, data) = crate::host::host()?.upload_buffer(bytes)?;
+        let h = crate::host::host()?;
+        let (table, data) = h.upload_buffer(bytes)?;
         crate::host::name(&table, || "title memory page table".into());
         let null = heap.pair()?;
         heap.raw_pair_at(null, None, 0);
+        let vram = (!h.is_uma()).then(|| h.default_uav_buffer(bytes)).flatten();
         // SAFETY: a live buffer.
-        let gpu = unsafe { table.GetGPUVirtualAddress() };
+        let gpu = unsafe { vram.as_ref().unwrap_or(&table).GetGPUVirtualAddress() };
         Some(Shared {
             host: std::ptr::from_ref(heap) as usize,
             table,
+            vram,
+            dirty: false,
             data: data as usize,
             gpu,
             null,
@@ -504,6 +565,7 @@ impl Shared {
     /// back, the table rewritten. Only while no submission runs (the GPU
     /// reads the table and the views).
     fn rewrite(&mut self, heap: &HostHeap, now: u64) {
+        self.dirty = true;
         let copies = crate::shadow::all();
         let live: HashSet<usize> = copies.iter().map(|c| Arc::as_ptr(c) as usize).collect();
         self.pairs.retain(|copy, &mut slot| {
@@ -616,13 +678,13 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
         let mut shared = shared();
         let host = std::ptr::from_ref(heap) as usize;
         if let Some((_, s)) = shared.iter().find(|(k, s)| *k == key && s.host == host) {
-            list.keep(&s.table);
+            list.keep(s.vram.as_ref().unwrap_or(&s.table));
             return Some(s.gpu);
         }
         // A released heap's table goes with it (lists that name it hold it).
         shared.retain(|(k, _)| *k != key);
         let s = Shared::new(heap)?;
-        list.keep(&s.table);
+        list.keep(s.vram.as_ref().unwrap_or(&s.table));
         let gpu = s.gpu;
         shared.push((key, s));
         Some(gpu)
@@ -630,6 +692,15 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
     .flatten()?;
     let pooled = Arc::new(PooledBitmap::new(Bitmap::acquire()?));
     let dirty = pooled.gpu();
+    if let Some(bm) = &pooled.bitmap
+        && let Some(vram) = &bm.vram
+    {
+        list.keep(vram);
+        ACTIVE_BITMAPS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((vram.clone(), bm._resource.clone()));
+    }
     list.defer_memory(key);
     let precise: Arc<Mutex<Vec<(u64, u64)>>> = Arc::default();
     let byte_for_byte = precise.clone();
